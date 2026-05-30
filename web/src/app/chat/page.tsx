@@ -2,17 +2,19 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, MessageSquarePlus, Plus, RefreshCw, Send, StopCircle, Trash2 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 
 import "highlight.js/styles/github-dark.css";
 
+import { VideoCard } from "@/components/video-card";
 import { Button } from "@/components/ui/button";
 import { streamChat, type ChatPersistedMessage, type ChatStreamMessage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
+import { parseVideoUrl } from "@/lib/video";
 import { useChatConversationsStore } from "@/store/chat-conversations";
 
 type ChatMessage = {
@@ -22,6 +24,45 @@ type ChatMessage = {
   status: "idle" | "streaming" | "error";
   error?: string;
 };
+
+function extractPlainText(node: unknown): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractPlainText).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    return extractPlainText((node as { props: { children?: unknown } }).props.children);
+  }
+  return "";
+}
+
+function buildAssistantMarkdownComponents(): Components {
+  return {
+    a({ href, children, node: _node, ...rest }) {
+      const video = href ? parseVideoUrl(String(href)) : null;
+      if (video) {
+        const label = extractPlainText(children).replace(/^\[+|\]+$/g, "").trim() || undefined;
+        return <VideoCard video={video} label={label} />;
+      }
+      return (
+        <a href={href} target="_blank" rel="noreferrer noopener" {...rest}>
+          {children}
+        </a>
+      );
+    },
+  };
+}
+
+function AssistantMarkdown({ content }: { content: string }) {
+  const components = buildAssistantMarkdownComponents();
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+      components={components}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
 
 function createId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -391,12 +432,7 @@ function ChatPageContent() {
                     {message.role === "assistant" ? (
                       message.content ? (
                         <div className="prose prose-sm chat-md max-w-none break-words">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
-                          >
-                            {message.content}
-                          </ReactMarkdown>
+                          <AssistantMarkdown content={message.content} />
                         </div>
                       ) : message.status === "streaming" ? (
                         <LoaderCircle className="size-4 animate-spin text-muted-foreground" />

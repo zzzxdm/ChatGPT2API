@@ -14,6 +14,7 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
+from services.protocol.chatgpt_markup import collect_references, sanitize
 from utils.helper import IMAGE_MODELS, extract_image_from_message_content
 from utils.log import logger
 
@@ -229,12 +230,16 @@ class ConversationRequest:
 @dataclass
 class ConversationState:
     text: str = ""
+    clean_text: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    references: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cite_numbers: dict[str, int] = field(default_factory=dict)
+    cite_counter: list[int] = field(default_factory=lambda: [0])
 
 
 @dataclass
@@ -386,6 +391,7 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         add_unique(state.sediment_ids, sediment_ids)
     if not isinstance(event, dict):
         return
+    collect_references(event, state.references)
     state.conversation_id = str(event.get("conversation_id") or state.conversation_id)
     value = event.get("v")
     if isinstance(value, dict):
@@ -405,7 +411,8 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
 def conversation_base_event(event_type: str, state: ConversationState, **extra: Any) -> dict[str, Any]:
     return {
         "type": event_type,
-        "text": state.text,
+        "text": state.clean_text or state.text,
+        "raw_text": state.text,
         "conversation_id": state.conversation_id,
         "file_ids": list(state.file_ids),
         "sediment_ids": list(state.sediment_ids),
@@ -441,12 +448,18 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
             state.text = ""
+            state.clean_text = ""
             continue
         next_text = assistant_text(event, state.text, history_text)
         if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
             state.text = next_text
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+            next_clean = sanitize(next_text, state.references, state.cite_numbers, state.cite_counter)
+            delta = next_clean[len(state.clean_text):] if next_clean.startswith(state.clean_text) else next_clean
+            state.clean_text = next_clean
+            if delta:
+                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+                continue
+            yield conversation_base_event("conversation.event", state, raw=event)
             continue
         yield conversation_base_event("conversation.event", state, raw=event)
 
