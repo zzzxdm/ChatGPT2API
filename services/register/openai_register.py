@@ -441,7 +441,7 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
 
 
 def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str) -> dict | None:
-    callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
+    callback_params = extract_oauth_callback_params_from_url(consent_url) or extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
     if not callback_params:
         return None
     code = str(callback_params.get("code") or "").strip()
@@ -536,6 +536,7 @@ class PlatformRegistrar:
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "platform authorize 完成")
+        return str(getattr(resp, "url", "") or "").strip()
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -587,7 +588,7 @@ class PlatformRegistrar:
         page_type = str(((data.get("page") or {}).get("type") or "")).strip()
         continue_url = str(data.get("continue_url") or data.get("redirect_url") or "").strip()
         step(index, f"登录验证码校验完成 page_type={page_type or '<empty>'}")
-        log(f"[diag] Login OTP validate 200 完整响应: {json.dumps(data, ensure_ascii=False)[:800]}", "yellow")
+        # log(f"[diag] Login OTP validate 200 完整响应: {json.dumps(data, ensure_ascii=False)[:800]}", "yellow")
         return continue_url, page_type
 
     def _password_verify(self, password: str, index: int) -> tuple[str, str]:
@@ -644,8 +645,9 @@ class PlatformRegistrar:
         step(index, f"开始重新登录认证: {email}")
         self._platform_authorize(email, index)
         continue_url, page_type = self._password_verify(password, index)
+        log(f"continue_url={continue_url} page_type={page_type}", "yellow")
+        final_continue_url = continue_url
         if page_type == "email_otp_verification":
-            self._send_login_otp(index)
             step(index, "开始等待登录验证码")
             code = wait_for_code(mailbox)
             if not code:
@@ -653,14 +655,19 @@ class PlatformRegistrar:
             step(index, f"收到登录验证码: {code}")
             otp_continue_url, page_type = self._validate_login_otp(code, index)
             log(f"otp_continue_url={otp_continue_url} page_type={page_type}", "yellow")
-        # tokens = self._login_and_exchange_tokens(email, password, mailbox, continue_url, index)
-        # https://chatgpt.com/api/auth/session 请求这个获取token
-        headers = dict(common_headers)
-        headers.update(_make_trace_headers())
-        get_session_token_url = f"https://chatgpt.com/api/auth/session"
-        resp, error = request_with_local_retry(self.session, "get", get_session_token_url, headers=headers, verify=False)
-        log(f"{resp.status_code} {resp.url} {resp.text}", "yellow")
-        tokens = {"access_token": str(resp.json().get("accessToken") or "").strip()}
+            if otp_continue_url:
+                final_continue_url = otp_continue_url
+        if page_type == "about_you":
+            step(index, "登录后进入 about_you，重新发起 platform authorize 获取 OAuth 授权地址", "yellow")
+            final_continue_url = self._platform_authorize(email, index)
+        try:
+            tokens = self._login_and_exchange_tokens(email, password, mailbox, final_continue_url, index)
+        except RuntimeError as exc:
+            if page_type == "about_you":
+                raise
+            step(index, f"登录返回的 continue_url 未能换取 token，重新发起 platform authorize: {exc}", "yellow")
+            final_continue_url = self._platform_authorize(email, index)
+            tokens = self._login_and_exchange_tokens(email, password, mailbox, final_continue_url, index)
         return {
             "email": email,
             "password": password or None,
